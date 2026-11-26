@@ -452,6 +452,39 @@ def test_export_dataset():
     qc_export = svc.export_with_quality_check(entry2["id"], 1, True)
     check(qc_export is not None, "export_dataset export_with_quality_check (passed) succeeds")
 
+    # 交付确认：实际输入按实际条数，重新生成不复用文件路径
+    entry3, _ = svc.create_entry({
+        "任务编号": "EXPO-DELIV", "数据来源": "交付数据", "导出格式": "CSV",
+        "压缩方式": "none",
+    })
+    view = svc.delivery_confirmation(entry3["id"])
+    check(view["generated"] is False and view["actual_rows"] is None,
+          "export_dataset 未生成与空产物区分")
+    svc.execute_export(entry3["id"], data=[{"r": 1}, {"r": 2}])
+    check(entry3["_exported_rows"] == 2, "export_dataset 实际输入按实际条数")
+    first_path = entry3["文件路径"]
+    svc.execute_export(entry3["id"], data=[{"r": 1}])
+    check(entry3["文件路径"] != first_path, "export_dataset 重新生成不复用文件路径")
+    view = svc.delivery_confirmation(entry3["id"])
+    check(view["actual_rows"] == 1 and len(view["batches"]) == 2,
+          "export_dataset 交付确认显示各批次行数")
+    confirmed = svc.confirm_delivery(entry3["id"], batch_no=1)
+    check(confirmed["ok"] and confirmed["manifest"]["rows"] == 2,
+          "export_dataset 按旧批次确认交付条数不变")
+    retried = svc.confirm_delivery(entry3["id"], batch_no=1)
+    check(retried["reused"] and retried["manifest"]["rows"] == 2,
+          "export_dataset 重复确认沿用原清单")
+
+    # 空产物确认条数为零
+    entry4, _ = svc.create_entry({
+        "任务编号": "EXPO-EMPTY", "数据来源": "空数据", "导出格式": "CSV",
+        "压缩方式": "none",
+    })
+    svc.execute_export(entry4["id"], data=[])
+    empty_confirmed = svc.confirm_delivery(entry4["id"])
+    check(empty_confirmed["ok"] and empty_confirmed["manifest"]["rows"] == 0,
+          "export_dataset 空产物确认条数为零")
+
     record_time("export_dataset", time.time() - t0)
     print(f"  export_dataset: OK")
 
@@ -532,6 +565,31 @@ def test_delivery_pipe():
 
     topic = svc.topic_overview(entry["id"])
     check("success_rate" in topic, "delivery_pipe topic_overview has success_rate")
+
+    # 接收预览：导出清单进入接收列表，领取/签收后回执条数与清单一致
+    ed = SERVICES["export_dataset"]
+    exp, _ = ed.create_entry({
+        "任务编号": "EXPO-TO-PIPE", "数据来源": "管道数据", "导出格式": "CSV",
+        "压缩方式": "none",
+    })
+    ed.execute_export(exp["id"], data=[{"r": 1}, {"r": 2}])
+    manifest = ed.confirm_delivery(exp["id"], pipe_id=entry["id"])["manifest"]
+    preview = svc.receive_preview(entry["id"])
+    check(any(r["manifest_id"] == manifest["manifest_id"] and r["rows"] == 2
+              for r in preview["inbox"]), "delivery_pipe 接收列表条数与清单一致")
+    claimed = svc.claim_manifest(entry["id"], manifest["manifest_id"])
+    check(claimed["ok"] and claimed["record"]["status"] == "已领取",
+          "delivery_pipe 领取清单")
+    signed = svc.sign_off(entry["id"], manifest["manifest_id"])
+    check(signed["ok"] and signed["receipt"]["rows"] == 2,
+          "delivery_pipe 签收回执条数与清单一致")
+    # 重新生成新版后旧回执仍按原清单打开
+    ed.execute_export(exp["id"], data=[{"r": 1}])
+    preview = svc.receive_preview(entry["id"])
+    old_receipt = [r for r in preview["receipts"]
+                   if r["receipt_id"] == signed["receipt"]["receipt_id"]]
+    check(len(old_receipt) == 1 and old_receipt[0]["rows"] == 2,
+          "delivery_pipe 旧回执不受重新生成影响")
 
     record_time("delivery_pipe", time.time() - t0)
     print(f"  delivery_pipe: OK")

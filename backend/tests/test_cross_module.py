@@ -320,6 +320,199 @@ class TestBusinessFailureScenarios:
 
 
 # ═══════════════════════════════════════════════════════════════
+# 数据导出 → 投递管道：交付确认与接收核对
+# ═══════════════════════════════════════════════════════════════
+
+class TestExportDeliveryFlow:
+    """交付确认：实际条数、批次归属、跨模块清单/回执一致性。"""
+
+    def _new_export(self, task_no: str):
+        ed = SERVICES["export_dataset"]
+        entry, missing = ed.create_entry(
+            {"任务编号": task_no, "数据来源": "交付核对数据源", "导出格式": "CSV",
+             "压缩方式": "none"})
+        assert entry is not None and not missing
+        return ed, entry
+
+    def _new_pipe(self, pipe_no: str):
+        dp = SERVICES["delivery_pipe"]
+        entry, missing = dp.create_entry(
+            {"配置编号": pipe_no, "目标系统": "Kafka", "投递方式": "push"})
+        assert entry is not None and not missing
+        return dp, entry
+
+    # ── 实际输入时批次详情必须是实际条数，不是模拟条数 ──
+    def test_actual_input_rows_win_over_simulated_count(self):
+        ed, entry = self._new_export("DELIV-ACTUAL")
+        ed.execute_export(entry["id"], data=[{"a": 1}, {"a": 2}])
+        assert entry["_exported_rows"] == 2
+        view = ed.delivery_confirmation(entry["id"])
+        assert view["generated"] is True
+        assert view["actual_rows"] == 2
+        batch = view["batches"][-1]
+        assert batch["rows"] == 2
+        assert batch["row_source"] == "actual"
+
+    def test_simulated_count_marked_as_simulated(self):
+        ed, entry = self._new_export("DELIV-SIM")
+        ed.execute_export(entry["id"], data=5)
+        view = ed.delivery_confirmation(entry["id"])
+        assert view["actual_rows"] == 5
+        assert view["batches"][-1]["row_source"] == "simulated"
+
+    # ── 重新生成不复用原文件路径 ──
+    def test_regenerate_uses_new_file_path(self):
+        ed, entry = self._new_export("DELIV-PATH")
+        ed.execute_export(entry["id"], data=[{"a": 1}, {"a": 2}])
+        first_path = entry["文件路径"]
+        ed.execute_export(entry["id"], data=[{"a": 1}])
+        second_path = entry["文件路径"]
+        assert first_path != second_path
+        view = ed.delivery_confirmation(entry["id"])
+        paths = [b["file_path"] for b in view["batches"]]
+        assert len(paths) == len(set(paths)) == 2
+
+    # ── 空产物与未生成是不同结果；空产物确认条数必须为零 ──
+    def test_empty_artifact_distinct_from_not_generated(self):
+        ed, entry = self._new_export("DELIV-EMPTY")
+        view = ed.delivery_confirmation(entry["id"])
+        assert view["generated"] is False
+        assert view["actual_rows"] is None
+        refused = ed.confirm_delivery(entry["id"])
+        assert refused["ok"] is False
+        ed.execute_export(entry["id"], data=[])
+        view = ed.delivery_confirmation(entry["id"])
+        assert view["generated"] is True
+        assert view["actual_rows"] == 0
+        assert view["batches"][-1]["empty"] is True
+        confirmed = ed.confirm_delivery(entry["id"])
+        assert confirmed["ok"] is True
+        assert confirmed["manifest"]["rows"] == 0
+
+    # ── 完整旅程：模拟5 → 实际2 → 交付 → 再生成1 → 重试第一次确认 ──
+    def test_journey_simulated5_actual2_regenerate1_retry_confirm(self):
+        ed, entry = self._new_export("DELIV-JOURNEY")
+        dp, pipe = self._new_pipe("DELIV-JOURNEY-PIPE")
+
+        # 模拟计数为五
+        ed.execute_export(entry["id"], data=5)
+        # 实际只有两条
+        ed.execute_export(entry["id"], data=[{"r": 1}, {"r": 2}])
+        actual_batch = entry["_batches"][-1]
+        assert actual_batch["rows"] == 2
+
+        # 发起交付：清单条数按实际两条
+        confirmed = ed.confirm_delivery(entry["id"], pipe_id=pipe["id"])
+        assert confirmed["ok"] is True
+        manifest = confirmed["manifest"]
+        assert manifest["batch_no"] == actual_batch["batch_no"]
+        assert manifest["rows"] == 2
+        assert manifest["file_path"] == actual_batch["file_path"]
+
+        # 投递管道接收列表与导出清单对得上
+        preview = dp.receive_preview(pipe["id"])
+        inbox = [r for r in preview["inbox"] if r["manifest_id"] == manifest["manifest_id"]]
+        assert len(inbox) == 1
+        assert inbox[0]["rows"] == 2
+        assert inbox[0]["file_path"] == actual_batch["file_path"]
+
+        # 另一窗口再生成一份单条版本
+        ed.execute_export(entry["id"], data=[{"r": 1}])
+        assert entry["_exported_rows"] == 1
+
+        # 旧确认界面重试第一次确认：仍按原批次，不悄悄换成最新一版
+        retried = ed.confirm_delivery(entry["id"], batch_no=actual_batch["batch_no"],
+                                      pipe_id=pipe["id"])
+        assert retried["ok"] is True
+        assert retried["reused"] is True
+        assert retried["manifest"]["manifest_id"] == manifest["manifest_id"]
+        assert retried["manifest"]["rows"] == 2
+        # 接收列表不因重试重复登记
+        preview = dp.receive_preview(pipe["id"])
+        assert sum(1 for r in preview["inbox"]
+                   if r["manifest_id"] == manifest["manifest_id"]) == 1
+
+        # 核对文件、清单和接收结果各自的条数：2 / 2 / 2
+        receipt = dp.sign_off(pipe["id"], manifest["manifest_id"])
+        assert receipt["ok"] is True
+        assert receipt["receipt"]["rows"] == 2
+        assert receipt["receipt"]["batch_no"] == actual_batch["batch_no"]
+        assert receipt["receipt"]["file_path"] == actual_batch["file_path"]
+        assert actual_batch["rows"] == 2 and manifest["rows"] == 2
+
+    # ── 再次生成后旧交付仍按原清单核对，原回执仍能打开 ──
+    def test_old_manifest_and_receipt_survive_regeneration(self):
+        ed, entry = self._new_export("DELIV-RECEIPT")
+        dp, pipe = self._new_pipe("DELIV-RECEIPT-PIPE")
+        ed.execute_export(entry["id"], data=[{"r": 1}, {"r": 2}, {"r": 3}])
+        old_batch = entry["_batches"][-1]
+        confirmed = ed.confirm_delivery(entry["id"], batch_no=old_batch["batch_no"],
+                                        pipe_id=pipe["id"])
+        manifest = confirmed["manifest"]
+        dp.claim_manifest(pipe["id"], manifest["manifest_id"])
+        signed = dp.sign_off(pipe["id"], manifest["manifest_id"])
+        receipt = signed["receipt"]
+
+        # 重新生成新版
+        ed.execute_export(entry["id"], data=[{"r": 9}])
+        assert entry["_batches"][-1]["batch_no"] != old_batch["batch_no"]
+
+        # 旧交付仍按原清单核对
+        view = ed.delivery_confirmation(entry["id"])
+        old_delivery = [d for d in view["deliveries"]
+                        if d["manifest_id"] == manifest["manifest_id"]]
+        assert len(old_delivery) == 1
+        assert old_delivery[0]["rows"] == 3
+        assert old_delivery[0]["batch_no"] == old_batch["batch_no"]
+        assert old_delivery[0]["pipe_status"] == "已签收"
+
+        # 原接收记录仍能按旧回执打开
+        preview = dp.receive_preview(pipe["id"])
+        reopened = [r for r in preview["receipts"]
+                    if r["receipt_id"] == receipt["receipt_id"]]
+        assert len(reopened) == 1
+        assert reopened[0]["rows"] == 3
+        assert reopened[0]["file_path"] == old_batch["file_path"]
+
+    # ── 已领取未答复时重新生成：迟到确认沿原领取继续，条数不变 ──
+    def test_late_signoff_after_regeneration_stays_on_claimed_round(self):
+        ed, entry = self._new_export("DELIV-LATE")
+        dp, pipe = self._new_pipe("DELIV-LATE-PIPE")
+        ed.execute_export(entry["id"], data=[{"r": 1}, {"r": 2}])
+        claimed_batch = entry["_batches"][-1]
+        manifest = ed.confirm_delivery(entry["id"], pipe_id=pipe["id"])["manifest"]
+        dp.claim_manifest(pipe["id"], manifest["manifest_id"])
+
+        # 接收端尚未答复，另一窗口重新生成新版
+        ed.execute_export(entry["id"], data=[{"r": 1}])
+        preview = dp.receive_preview(pipe["id"])
+        assert len(preview["pending_signoff"]) == 1
+        assert preview["pending_signoff"][0]["rows"] == 2
+
+        # 迟到确认沿原领取继续：回执仍指向被领取的那一轮
+        signed = dp.sign_off(pipe["id"], manifest["manifest_id"])
+        assert signed["receipt"]["batch_no"] == claimed_batch["batch_no"]
+        assert signed["receipt"]["rows"] == 2
+        assert signed["receipt"]["file_path"] == claimed_batch["file_path"]
+
+        # 重复签收沿用原回执
+        again = dp.sign_off(pipe["id"], manifest["manifest_id"])
+        assert again["reused"] is True
+        assert again["receipt"]["receipt_id"] == signed["receipt"]["receipt_id"]
+
+    # ── 接收端说明实际处理了哪份文件：不一致要标出来 ──
+    def test_signoff_flags_processed_file_mismatch(self):
+        ed, entry = self._new_export("DELIV-MISMATCH")
+        dp, pipe = self._new_pipe("DELIV-MISMATCH-PIPE")
+        ed.execute_export(entry["id"], data=[{"r": 1}])
+        manifest = ed.confirm_delivery(entry["id"], pipe_id=pipe["id"])["manifest"]
+        signed = dp.sign_off(pipe["id"], manifest["manifest_id"],
+                             processed_file="/exports/elsewhere.csv")
+        assert signed["receipt"]["file_mismatch"] is True
+        assert signed["receipt"]["rows"] == 1
+
+
+# ═══════════════════════════════════════════════════════════════
 # 18 个模块 Domain Snapshot 完整性测试
 # ═══════════════════════════════════════════════════════════════
 

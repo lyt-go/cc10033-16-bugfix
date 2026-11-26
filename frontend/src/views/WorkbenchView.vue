@@ -90,6 +90,17 @@
       <span>共 {{ total }} 条{{ meta.name }}记录</span>
       <span v-if="errorMessage" class="error-text">{{ errorMessage }}</span>
     </footer>
+
+    <ExportDeliverySection
+      v-if="meta.key === 'export_dataset'"
+      :rows="rows"
+      @changed="reload"
+    />
+    <DeliveryInboxSection
+      v-if="meta.key === 'delivery_pipe'"
+      :rows="rows"
+      @changed="reload"
+    />
   </section>
 </template>
 
@@ -104,6 +115,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import DeliveryInboxSection from '@/views/DeliveryInboxSection.vue'
+import ExportDeliverySection from '@/views/ExportDeliverySection.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
